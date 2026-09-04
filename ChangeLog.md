@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 ### Added
+- Added support for the Nordic Semiconductor nRF9151 running the Serial LTE Modem firmware (`TINY_GSM_MODEM_NRF9151`)
 
 ### Removed
 

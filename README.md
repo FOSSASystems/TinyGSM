@@ -78,6 +78,7 @@ TinyGSM also pulls data gently from the modem (whenever possible), so it can ope
 - u-blox 2G, 3G, 4G, and LTE Cat1 Cellular Modems (many modules including LEON-G100, LISA-U2xx, SARA-G3xx, SARA-U2xx, TOBY-L2xx, LARA-R2xx, MPCI-L2xx)
 - u-blox LTE-M/NB-IoT Modems (SARA-R4xx, SARA-N4xx, SARA-R5xx, _but NOT SARA-N2xx_)
 - Sequans Monarch LTE Cat M1/NB1 (VZM20Q)
+- Nordic Semiconductor nRF9151 LTE-M/NB-IoT (running the Serial LTE Modem firmware)
 - Quectel BG96
 - Quectel BG95
 - Quectel M95
@@ -120,12 +121,13 @@ Watch this repo for new updates! And of course, contributions are welcome ;)
         - SIM A7672X - 10
         - u-blox 2G/3G - 7
         - u-blox SARA R4/N4 - 7
+        - Nordic nRF9151 - 2
         - Digi XBee - _only 1 connection supported!_
 - UDP
     - Not yet supported on any module, though it may be some day
 - SSL/TLS (HTTPS)
     - Supported on:
-        - SIM800, SIM7000, A7672X, u-Blox, XBee _cellular_, ESP8266, Sequans Monarch and Quectel BG95 and BG96
+        - SIM800, SIM7000, A7672X, u-Blox, XBee _cellular_, ESP8266, Sequans Monarch, Nordic nRF9151 and Quectel BG95 and BG96
         - Note:  **only some device models or firmware revisions have this feature** (SIM8xx R14.18, A7, etc.)
     - Not yet supported on:
         - SIM 5360/5320/7100, SIM 7500/7600/7800

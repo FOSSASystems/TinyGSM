@@ -33,6 +33,7 @@
 // #define TINY_GSM_MODEM_ESP32
 // #define TINY_GSM_MODEM_XBEE
 // #define TINY_GSM_MODEM_SEQUANS_MONARCH
+// #define TINY_GSM_MODEM_NRF9151
 
 // Set serial for debug console (to the Serial Monitor, default speed 115200)
 #define SerialMon Serial
