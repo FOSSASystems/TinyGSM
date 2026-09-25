@@ -18,9 +18,9 @@
  *
  * Notes:
  *  - This class assumes the *caller* serializes all access to the sockets
- *    it creates (e.g. via an external mutex) so that "select socket, then
- *    operate on it" sequences are never interleaved by another thread/task.
- *    No locking is done inside this class.
+ *    it creates (e.g. via an external mutex) so that concurrent operations
+ *    on different muxes are never raced by another thread/task. No locking
+ *    is done inside this class.
  */
 
 #ifndef SRC_TINYGSMCLIENTNRF9151_H_
@@ -32,6 +32,34 @@
 // Two simultaneous sockets are supported, e.g. one MQTT-over-TLS connection
 // and one HTTP-over-TLS connection.
 #define TINY_GSM_MUX_COUNT 2
+// Size of the receive request issued when polling a socket for data.
+#ifndef TINY_GSM_RX_BUFFER
+#define TINY_GSM_RX_BUFFER 1024
+#endif
+// Maximum number of bytes requested by a single "#XRECV".
+#ifndef TINY_GSM_NRF9151_RECV_SEGMENT
+#define TINY_GSM_NRF9151_RECV_SEGMENT 2048
+#endif
+// How long the modem may block in zsock_recv() waiting for socket data (the
+// <timeout> field of "#XRECV"). zsock_recv() returns as soon as any data is
+// available, so this is only the upper bound on an idle wait.
+#ifndef TINY_GSM_NRF9151_RECV_TIMEOUT_S
+#define TINY_GSM_NRF9151_RECV_TIMEOUT_S 1
+#endif
+// The host-side wait for that command's response MUST exceed the modem-side
+// timeout above. Otherwise waitResponse() abandons an "#XRECV" that is still
+// in flight, the modem's late reply desynchronises the AT stream, and every
+// response slower than the host-side wait costs a wasted poll cycle.
+#ifndef TINY_GSM_NRF9151_RECV_WAIT_MS
+#define TINY_GSM_NRF9151_RECV_WAIT_MS \
+  ((TINY_GSM_NRF9151_RECV_TIMEOUT_S * 1000L) + 1000L)
+#endif
+// How long after the last outbound send (or last byte received) a socket is
+// considered to be "actively exchanging", and so polled for incoming data as
+// fast as the modem will answer.
+#ifndef TINY_GSM_NRF9151_RX_BURST_MS
+#define TINY_GSM_NRF9151_RX_BURST_MS 3000L
+#endif
 #define TINY_GSM_BUFFER_READ_AND_CHECK_SIZE
 #ifdef AT_NL
 #undef AT_NL
@@ -90,8 +118,11 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
       this->at       = modem;
       sock_available = 0;
       prev_check     = 0;
-      sock_connected = false;
-      got_data       = false;
+      sock_connected  = false;
+      got_data        = false;
+      _txLen          = 0;
+      _lastExchangeMs = 0;
+      _awaitingReply  = false;
 
       if (mux < TINY_GSM_MUX_COUNT) {
         this->mux = mux;
@@ -114,6 +145,9 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
     TINY_GSM_CLIENT_CONNECT_OVERRIDES
 
     void stop(uint32_t maxWaitMs) {
+      _txLen         = 0;  // drop anything buffered but never sent -- the
+                           // socket it was destined for is going away.
+      _awaitingReply = false;
       dumpModemBuffer(maxWaitMs);
       at->closeSocket(mux, maxWaitMs);
       sock_connected = false;
@@ -122,11 +156,111 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
       stop(15000L);
     }
 
+    size_t write(const uint8_t* buf, size_t size) override {
+      size_t written = 0;
+      while (written < size) {
+        size_t space = sizeof(_txBuf) - _txLen;
+        if (space == 0) {
+          if (!flushTx()) { break; }
+          space = sizeof(_txBuf);
+        }
+        size_t chunk = TinyGsmMin(space, size - written);
+        memcpy(_txBuf + _txLen, buf + written, chunk);
+        _txLen += chunk;
+        written += chunk;
+      }
+      return written;
+    }
+    size_t write(uint8_t c) override {
+      return write(&c, 1);
+    }
+
+    size_t availableLocal() { return (size_t)rx.size(); }
+
+    int available() override {
+      flushTx();
+      if (rx.size()) {
+        _lastExchangeMs = millis();
+        return (int)rx.size() + sock_available;
+      }
+      // Poll the modem immediately only while a reply is outstanding.
+      if (_awaitingReply &&
+          millis() - _lastExchangeMs < TINY_GSM_NRF9151_RX_BURST_MS) {
+        got_data   = true;
+        prev_check = millis();
+      }
+      int avail = GsmClient::available();
+      if (avail > 0) {
+        _lastExchangeMs = millis();
+        _awaitingReply  = false;
+      }
+      return avail;
+    }
+
+    int read(uint8_t* buf, size_t size) override {
+      flushTx();
+      if (rx.size()) {
+        size_t chunk = TinyGsmMin(size, (size_t)rx.size());
+        rx.get(buf, chunk);
+        _lastExchangeMs = millis();
+        _awaitingReply  = false;
+        return (int)chunk;
+      }
+      int got = GsmClient::read(buf, size);
+      if (got > 0) {
+        _lastExchangeMs = millis();
+        _awaitingReply  = false;
+      }
+      return got;
+    }
+
+    int read() override {
+      uint8_t c;
+      if (read(&c, 1) == 1) { return (int)c; }
+      return -1;
+    }
+
+    void flush() override {
+      flushTx();
+      GsmClient::flush();
+    }
+
+    uint8_t connected() override {
+      flushTx();
+      if (rx.size()) { return true; }
+      return sock_connected;
+    }
+
     /*
      * Extended API
      */
 
     String remoteIP() TINY_GSM_ATTR_NOT_IMPLEMENTED;
+
+   protected:
+    // Sends any buffered outgoing bytes as a single #XSEND and clears the
+    // buffer.
+    bool flushTx() {
+      if (_txLen == 0) { return true; }
+      // Having just sent something, a reply is expected imminently
+      _lastExchangeMs = millis();
+      _awaitingReply  = true;
+      int16_t sent = at->modemSend(_txBuf, _txLen, mux);
+      bool    ok   = (sent >= 0 && (size_t)sent == _txLen);
+      _txLen       = 0;
+      return ok;
+    }
+
+    // Sized to modemSend()'s own #XSEND payload cap (Nordic's documented
+    // maximum), so a full buffer always flushes as exactly one #XSEND.
+    uint8_t  _txBuf[1024];
+    size_t   _txLen = 0;
+    // Last time this socket sent or received anything; gates burst polling.
+    uint32_t _lastExchangeMs = 0;
+    // True between sending something and receiving anything back, i.e. only
+    // while a blocking receive can actually be expected to find data. See
+    // available().
+    bool _awaitingReply = false;
   };
 
   /*
@@ -238,7 +372,9 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
   // setPhoneFunctionalityImpl() below, i.e. "AT+CFUN=0".
 
   bool sleepEnableImpl(bool enable = true) {
-    // Maps enable to #XSLEEP mode 1 (idle sleep) and disable to 0.
+    // #XSLEEP modes: 1 terminates the SLM service and the LTE connection,
+    // 2 is an idle sleep in which only the UART is disabled. Enabling sleep
+    // uses mode 1.
     sendAT(GF("#XSLEEP="), enable ? 1 : 0);
     return waitResponse(10000L) == 1;
   }
@@ -253,10 +389,68 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
   }
 
   bool setBaudImpl(uint32_t baud) {
-    // #XSLMUART configures the UART link between the host MCU and the
-    // modem, including its baud rate.
-    sendAT(GF("#XSLMUART="), baud);
+    sendAT(GF("+IPR="), baud);
     return waitResponse() == 1;
+  }
+
+  /*
+   * Network system mode
+   */
+ public:
+  bool getNetworkSystemMode(bool& n, int16_t& stat) {
+    // Read:
+    // %XSYSTEMMODE: <lte_m_support>, <nb_iot_support>,
+    //               <gnss_support>, <lte_preference>
+
+    sendAT(GF("%XSYSTEMMODE?"));
+
+    if (waitResponse(
+            GF(AT_NL "%XSYSTEMMODE:")) != 1) {
+        return false;
+    }
+
+    const int16_t lteMEnabled = streamGetIntBefore(',');
+    const int16_t nbIotEnabled = streamGetIntBefore(',');
+    const int16_t gnssEnabled = streamGetIntBefore(',');
+
+    stat = streamGetIntBefore('\n');
+
+    if (waitResponse() != 1) {
+        return false;
+    }
+
+    // Preference 1 explicitly prefers LTE-M.
+    // Preference 3 also prefers LTE-M when network priorities are equal.
+    n = (stat == 1 || stat == 3);
+
+    (void)gnssEnabled;
+
+    // Reports success only if both LTE-M and NB-IoT are enabled.
+    return lteMEnabled == 1 && nbIotEnabled == 1;
+  }
+
+  bool setNetworkSystemMode(bool n = true) {
+    // Enables LTE-M only (NB-IoT and GNSS are left disabled).
+    // %XSYSTEMMODE must be changed while the modem is inactive.
+    const int8_t preference = n ? 1 : 0;
+
+    if (!setPhoneFunctionality(0)) {
+        return false;
+    }
+
+    sendAT(
+        GF("%XSYSTEMMODE="),
+        1, GF(","),       // LTE-M enabled
+        0, GF(","),       // NB-IoT enabled
+        0, GF(","),       // GNSS disabled
+        preference        // LTE-M preferred or automatic
+    );
+
+    if (waitResponse() != 1) {
+        return false;
+    }
+
+    return setPhoneFunctionality(1);
   }
 
   /*
@@ -285,21 +479,22 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
  protected:
   // IMPORTANT: This must only be called *before* attempting to register on
   // the network (i.e. before gprsConnect()/attaching). Writing a TLS
-  // credential requires putting the modem in offline mode (AT+CFUN=4); if
-  // the modem is already registered, cycling CFUN=4 -> CFUN=1 here will
-  // drop that connection. Calling this at the right point in the
+  // credential requires putting the modem in minimum-functionality mode
+  // (AT+CFUN=0 or 4); if the modem is already registered, cycling CFUN=0->1
+  // here will drop that connection. Calling this at the right point in the
   // connection lifecycle is the responsibility of the code that uses this
   // class -- this class does not try to detect or guard against misuse.
   bool addCertificateImpl(const char* certificateName, const char* cert,
                           const uint16_t len) {
     long sec_tag = atol(certificateName);
 
-    // #XCMNG subcommand 1 lists the credentials stored for this sec_tag, so
-    // a credential that is already present is not re-written (which would
-    // require cycling CFUN again).
+    // %CMNG is the modem's native credential-storage command (passed through
+    // by SLM as-is). Subcommand 1 lists the credentials stored for this
+    // sec_tag, so a credential that is already present is not re-written
+    // (which would require cycling CFUN again).
     bool alreadyHasCert = false;
-    sendAT(GF("#XCMNG=1,"), sec_tag, GF(",0"));
-    if (waitResponse(5000L, GF(AT_NL "#XCMNG:")) == 1) {
+    sendAT(GF("%CMNG=1,"), sec_tag, GF(",0"));
+    if (waitResponse(5000L, GF(AT_NL "%CMNG:")) == 1) {
       streamSkipUntil('\n');  // consume the rest of the listing line
       waitResponse();
       alreadyHasCert = true;
@@ -313,22 +508,32 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
       return true;
     }
 
-    // Credential writes require the modem to be offline first.
-    sendAT(GF("+CFUN=4"));
+    // Credential writes require minimum-functionality mode or flight mode.
+    sendAT(GF("+CFUN=0"));
     if (waitResponse(10000L) != 1) { return false; }
 
-    // #XCMNG=<opcode>,<sec_tag>,<type>,<content>
-    // opcode 0 = write; type 0 = root CA certificate (1 = client cert, 2 =
-    // client private key -- neither is used here, only the CA cert is
-    // provisioned for server-authenticated TLS).
-    // The certificate body is written directly from the caller-provided
-    // buffer/length rather than assuming it is a null-terminated C string.
-    stream.print(GF("AT#XCMNG=0,"));
+    // The certificate is sent one PEM line at a time, as a single quoted
+    // string spanning several lines.
+    stream.print(GF("AT%CMNG=0,"));
     stream.print(sec_tag);
     stream.print(GF(",0,\""));
-    stream.write(reinterpret_cast<const uint8_t*>(cert), len);
-    stream.print(GF("\"" AT_NL));
-    stream.flush();
+    const char* p   = cert;
+    const char* end = cert + len;
+    if (end > p && *(end - 1) == '\n') { end--; }  // trailing '\n' is not its own line
+    while (p < end) {
+      const char* nl =
+          static_cast<const char*>(memchr(p, '\n', end - p));
+      const char* lineEnd = nl ? nl : end;
+      stream.write(reinterpret_cast<const uint8_t*>(p), lineEnd - p);
+      if (nl) {
+        stream.print(AT_NL);
+      } else {
+        stream.print(GF("\"" AT_NL));  // last line: close the quoted string
+      }
+      stream.flush();
+      delay(150);  // give the SLM's line parser time to keep up
+      p = nl ? nl + 1 : end;
+    }
     TINY_GSM_YIELD();
     bool success = waitResponse(10000L) == 1;
 
@@ -343,11 +548,11 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
   bool deleteCertificateImpl(const char* filename) {
     long sec_tag = atol(filename);
 
-    sendAT(GF("+CFUN=4"));
+    sendAT(GF("+CFUN=0"));
     if (waitResponse(10000L) != 1) { return false; }
 
     // opcode 3 = delete.
-    sendAT(GF("#XCMNG=3,"), sec_tag, GF(",0"));
+    sendAT(GF("%CMNG=3,"), sec_tag, GF(",0"));
     bool success = waitResponse(10000L) == 1;
 
     sendAT(GF("+CFUN=1"));
@@ -362,10 +567,6 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
  protected:
   bool gprsConnectImpl(const char* apn, const char* user = nullptr,
                        const char* pwd = nullptr) {
-    // Like u-blox's LTE-M/NB-IoT SARA-R4 modules, the nRF91 series uses a
-    // single "external" PDP context set up via the standard 3GPP
-    // CGDCONT/CGATT/CGACT commands -- there is no SIMCOM-style separate
-    // "application network" activation step here.
     if (user && strlen(user) > 0) {
       sendAT(GF("+CGAUTH=1,0,\""), user, GF("\",\""), pwd, '"');
       waitResponse();
@@ -404,8 +605,8 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
    * SIM card functions
    */
  protected:
-  // This uses "CGSN" (as SARA-R4 also does) rather than the plain "GSN"
-  // TinyGsmGPRS default, matching Nordic's documented AT+CGSN support.
+  // This uses "CGSN" rather than the plain "GSN" used by the TinyGsmGPRS
+  // default, matching Nordic's documented AT+CGSN support.
   String getIMEIImpl() {
     sendAT(GF("+CGSN"));
     if (waitResponse(GF(AT_NL)) != 1) { return ""; }
@@ -425,31 +626,6 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
    * Client related (socket) functions
    */
  protected:
-  // Makes sure the socket identified by `mux` is the one that subsequent
-  // #XSEND/#XRECV operate on. Per the design of this driver, this is called
-  // immediately before every single send/receive/connect operation on a
-  // given mux -- it deliberately does NOT cache "already selected" state,
-  // both for simplicity and because a spontaneous URC (e.g. the peer
-  // closing the other socket) could otherwise leave that cache stale.
-  bool selectSocket(uint8_t mux) {
-    if (mux >= TINY_GSM_MUX_COUNT || socketHandles[mux] < 0) { return false; }
-    sendAT(GF("#XSOCKETSELECT="), socketHandles[mux]);
-    // The response may optionally echo
-    // "#XSOCKETSELECT: <handle>,<type>,<protocol>" ahead of the terminal
-    // OK; handle both that and a bare OK/ERROR defensively.
-    int8_t res = waitResponse(3000L, GF(AT_NL "#XSOCKETSELECT:"),
-                              GFP(GSM_OK), GFP(GSM_ERROR));
-    bool   ok  = false;
-    if (res == 1) {
-      streamSkipUntil('\n');
-      ok = waitResponse() == 1;
-    } else {
-      ok = res == 2;
-    }
-    if (ok) { activeMux = mux; }
-    return ok;
-  }
-
   // Closes and releases the socket (if any) currently assigned to `mux`.
   // Called from GsmClientNRF9151::stop() -- kept here, rather than inlined
   // in the nested client class, so all the AT parsing for it lives
@@ -457,18 +633,12 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
   void closeSocket(uint8_t mux, uint32_t maxWaitMs) {
     if (mux >= TINY_GSM_MUX_COUNT || socketHandles[mux] < 0) { return; }
     uint32_t startMillis = millis();
-    // #XSOCKET=0 closes whichever socket is currently selected -- this
-    // applies the same way whether it was opened with #XSOCKET or with
-    // #XSSOCKET.
-    if (selectSocket(mux)) {
-      sendAT(GF("#XSOCKET=0"));
-      uint32_t elapsed = millis() - startMillis;
-      if (waitResponse(elapsed > maxWaitMs ? 0 : maxWaitMs - elapsed,
-                       GF(AT_NL "#XSOCKET:")) == 1) {
-        streamSkipUntil('\n');
-      }
-      waitResponse(2000L);
+    sendAT(GF("#XCLOSE="), socketHandles[mux]);
+    if (waitResponse(maxWaitMs, GF(AT_NL "#XCLOSE:")) == 1) {
+      streamSkipUntil('\n');
     }
+    uint32_t elapsed = millis() - startMillis;
+    waitResponse(elapsed > maxWaitMs ? 0 : maxWaitMs - elapsed);
     socketHandles[mux] = -1;
     if (activeMux == mux) { activeMux = -1; }
   }
@@ -491,7 +661,7 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
       }
       // #XSSOCKET=<op>,<type>,<role>,<sec_tag>[,<peer_verify>[,<cid>]]
       // op=1 (open IPv4), type=1 (TLS 1.2), role=0 (client)
-      sendAT(GF("#XSSOCKET=1,1,0,"), sec_tag);
+      sendAT(GF("#XSSOCKET=1,1,0,"), sec_tag, GF(",2,0"));
       if (waitResponse(timeout_ms, GF(AT_NL "#XSSOCKET:")) != 1) {
         return false;
       }
@@ -510,33 +680,122 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
 
     if (handle < 0) { return false; }
     socketHandles[mux] = handle;
+    activeMux = mux;
 
-    if (!selectSocket(mux)) { return false; }
+    if (ssl) {
+      // Set the TLS peer name after the socket-open response has been fully
+      // consumed, before starting the connection.
+      sendAT(GF("#XSSOCKETOPT="), handle, GF(",1,2,\""), host, GF("\""));
+      if (waitResponse(timeout_ms) != 1) {
+        closeSocket(mux, 15000L);
+        return false;
+      }
+    }
 
-    // #XCONNECT is shared by plain and native-TLS sockets alike, once the
-    // socket has been opened and selected.
-    sendAT(GF("#XCONNECT=\""), host, GF("\","), port);
+    sendAT(GF("#XCONNECT="), handle, GF(",\""), host, GF("\","), port);
     uint32_t elapsed = millis() - startMillis;
     if (waitResponse(elapsed > timeout_ms ? 0 : timeout_ms - elapsed,
                      GF(AT_NL "#XCONNECT:")) != 1) {
+      // The socket was opened but never connected -- close it so our
+      // bookkeeping doesn't keep believing this mux owns a live handle
+      // (the modem itself may drop it independently on a failed connect).
+      closeSocket(mux, 15000L);
       return false;
     }
-    int8_t status = streamGetIntBefore('\n');  // 1 = connected
+
+    // #XCONNECT: <handle>,<status> (status 1 = connected)
+    // The handle field must be consumed before the status; reading the whole
+    // remainder as one integer would return the handle instead.
+    const int16_t connHandle = streamGetIntBefore(',');
+    const int8_t  status     = streamGetIntBefore('\n');
     waitResponse();
-    return status == 1;
+    if (connHandle != handle || status != 1) {
+      closeSocket(mux, 15000L);
+      return false;
+    }
+    return true;
+  }
+
+ protected:
+  // A payload containing a NUL cannot go out as a mode-0 quoted string:
+  // the SLM's AT parser treats the 0x00 as end-of-string before any
+  // quote/escape handling runs, so the command line is truncated and
+  // rejected outright.
+  static bool payloadNeedsDataMode(const void* buff, size_t len) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(buff);
+    for (size_t i = 0; i < len; i++) {
+      if (p[i] == 0x00) { return true; }
+    }
+    return false;
+  }
+
+  // Mode 2 ("data mode"): the byte count is declared up front and the payload
+  // is then streamed raw, so none of it is parsed as AT syntax. Completion
+  // arrives asynchronously as "#XDATAMODE: <status>" (0 = success) instead of
+  // the synchronous "#XSEND:" that mode 0 returns, and no "+++" terminator is
+  // needed because <data_len> was supplied.
+  int16_t modemSendDataMode(const void* buff, size_t chunk, int16_t handle) {
+    // Terminated with a bare CR, deliberately not sendAT(): the modem is
+    // built with CONFIG_SM_CR_TERMINATION, so it dispatches the command on
+    // the CR and switches into data mode synchronously, before the next byte
+    // off the UART is parsed.
+    stream.print(GF("AT#XSEND="));
+    stream.print(handle);
+    stream.print(GF(",2,0,"));
+    stream.print((uint32_t)chunk);
+    stream.print('\r');
+    stream.flush();
+    TINY_GSM_YIELD();
+    if (waitResponse(3000L) != 1) { return 0; }
+
+    const uint8_t* p       = reinterpret_cast<const uint8_t*>(buff);
+    size_t         written = 0;
+    uint32_t       lastProgressMs = millis();
+    while (written < chunk) {
+      size_t n = stream.write(p + written, chunk - written);
+      if (n > 0) {
+        written += n;
+        lastProgressMs = millis();
+      } else if (millis() - lastProgressMs > 10000L) {
+        break;
+      }
+      TINY_GSM_YIELD();
+    }
+    stream.flush();
+    TINY_GSM_YIELD();
+
+    if (written != chunk) {
+      // The modem is still waiting for the remainder, so the AT channel is
+      // unusable until it times out on its own. Report the failure; the
+      // caller's socket-level error handling has to take it from here.
+      DBG("### #XSEND data mode short write:", written, "of", chunk);
+      return 0;
+    }
+
+    if (waitResponse(10000L, GF(AT_NL "#XDATAMODE:")) != 1) { return 0; }
+    const int16_t status = streamGetIntBefore('\n');
+    return status == 0 ? (int16_t)chunk : 0;
   }
 
   int16_t modemSend(const void* buff, size_t len, uint8_t mux) {
-    if (!sockets[mux]) { return 0; }
-    if (!selectSocket(mux)) { return 0; }
+    if (!sockets[mux] || socketHandles[mux] < 0) { return 0; }
 
     size_t chunk = len;
     if (chunk > 1024) { chunk = 1024; }  // #XSEND max payload per Nordic docs
 
-    // #XSEND takes its payload inline, as a quoted string, in the AT command
-    // line itself. Embedded quotes and backslashes are escaped below, but
-    // raw CR/LF/NUL bytes cannot be represented this way.
-    stream.print(GF("AT#XSEND=\""));
+    const int16_t handle = socketHandles[mux];
+    if (payloadNeedsDataMode(buff, chunk)) {
+      return modemSendDataMode(buff, chunk, handle);
+    }
+
+    // AT#XSEND=<handle>,0,0,"payload"
+    // Response is:
+    // #XSEND: <handle>,<flags>,<bytes_sent>
+    // The payload remains inline as a quoted string, but the socket handle
+    // and the 0,0 flags must precede it.
+    stream.print(GF("AT#XSEND="));
+    stream.print(handle);
+    stream.print(GF(",0,0,\""));
     for (size_t i = 0; i < chunk; i++) {
       uint8_t c = reinterpret_cast<const uint8_t*>(buff)[i];
       if (c == '\"' || c == '\\') { stream.write('\\'); }
@@ -547,36 +806,44 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
     TINY_GSM_YIELD();
 
     if (waitResponse(GF(AT_NL "#XSEND:")) != 1) { return 0; }
+    streamSkipUntil(',');  // handle
+    streamSkipUntil(',');  // flags
     int16_t sent = streamGetIntBefore('\n');
     waitResponse();
     return sent;
   }
 
+  // #XRECV is handle-scoped on this SLM build. The final argument is
+  // the maximum number of bytes to return; the response contains raw bytes,
+  // not a quoted string.
   size_t modemRead(size_t size, uint8_t mux) {
-    if (!sockets[mux]) { return 0; }
-    if (!selectSocket(mux)) { return 0; }
+    if (!sockets[mux] || socketHandles[mux] < 0) { return 0; }
 
-    // #XRECV's only parameter is a receive *timeout* in seconds, not a
-    // byte count -- unlike most other TinyGSM modems there is no way to
-    // ask for "up to N bytes". We use a short timeout since this is only
-    // called once data is already believed to be waiting (via the
-    // "#XRECV:" URC, see handleURCs below), and cap what we copy into our
-    // local FIFO at `size` -- anything the modem returns beyond that is
-    // still read off the wire (to keep the AT parser in sync) but
-    // discarded; TINY_GSM_BUFFER_READ_AND_CHECK_SIZE will pick it up again
-    // on a subsequent read.
-    sendAT(GF("#XRECV=1"));
-    if (waitResponse(GF(AT_NL "#XRECV:")) != 1) { return 0; }
-    int16_t len = streamGetIntBefore('\n');
-    if (len <= 0) {
+    const int16_t handle = socketHandles[mux];
+    const size_t requestSize =
+        TinyGsmMin(size, static_cast<size_t>(TINY_GSM_NRF9151_RECV_SEGMENT));
+    // #XRECV=<handle>,<flags>,<reserved>,<timeout>,<max_size>
+    // flags 0, reserved 0. Note the explicit GF(",") separators: sendAT()
+    // concatenates its arguments with no delimiter of its own.
+    sendAT(GF("#XRECV="), handle, GF(",0,0,"),
+           TINY_GSM_NRF9151_RECV_TIMEOUT_S, GF(","), requestSize);
+    // The host-side wait deliberately exceeds the modem-side timeout above
+    // (see TINY_GSM_NRF9151_RECV_WAIT_MS).
+    if (waitResponse(TINY_GSM_NRF9151_RECV_WAIT_MS, GF(AT_NL "#XRECV:")) != 1) {
+      return 0;
+    }
+
+    const int16_t responseHandle = streamGetIntBefore(',');
+    streamSkipUntil(',');  // flags
+    const int16_t len = streamGetIntBefore('\n');
+    if (responseHandle != handle || len <= 0) {
       waitResponse();
       sockets[mux]->sock_available = 0;
       return 0;
     }
 
-    // #XRECV: <size>\r\n"<data>"\r\nOK
-    streamSkipUntil('\"');  // opening quote
-    size_t toStore = TinyGsmMin((size_t)len, size);
+    // #XRECV: <handle>,<flags>,<size>\r\n<data>\r\nOK
+    size_t toStore = TinyGsmMin((size_t)len, requestSize);
     for (int i = 0; i < len; i++) {
       if ((size_t)i < toStore) {
         moveCharFromStreamToFifo(mux);
@@ -589,59 +856,104 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
         stream.read();
       }
     }
-    streamSkipUntil('\"');  // closing quote
     waitResponse();
 
-    sockets[mux]->sock_available = modemGetAvailable(mux);
+    sockets[mux]->sock_available = 0;
     return toStore;
   }
 
   size_t modemGetAvailable(uint8_t mux) {
-    if (!sockets[mux]) { return 0; }
-    // SLM's #XRECV command has no distinct "peek size" form: any call to it
-    // performs (and consumes) a receive, so it cannot be used here without
-    // destructively pulling data out of band from modemRead(). Data
-    // availability is therefore tracked from the "#XRECV: <size>" URC that
-    // the modem pushes when new data arrives (see handleURCs); this call
-    // just returns that cached count, while opportunistically re-checking
-    // that the socket is still connected so a remote close is still
-    // detected even if its own notification was missed.
-    size_t result = sockets[mux]->sock_available;
-    if (!result) { sockets[mux]->sock_connected = modemGetConnected(mux); }
-    return result;
+    if (!sockets[mux] || socketHandles[mux] < 0) { return 0; }
+
+    // This SLM build reports readable data through its internal socket poll
+    // state, but does not emit a #XRECV URC over the AT interface. TinyGSM's
+    // available() path reaches here before read(), so issue the receive here
+    // when no URC has already supplied a byte count. modemRead() places the
+    // raw response bytes directly into the client RX FIFO.
+    if (!sockets[mux]->sock_available) {
+      modemRead(TINY_GSM_RX_BUFFER, mux);
+    }
+    return sockets[mux]->sock_available;
   }
 
   bool modemGetConnected(uint8_t mux) {
-    if (!sockets[mux]) { return false; }
-    if (!selectSocket(mux)) { return false; }
-    // There is no dedicated "get socket status" query; the read form of
-    // #XSOCKET is used to report the state of the currently selected socket.
+    if (!sockets[mux] || socketHandles[mux] < 0) { return false; }
+
+    const int16_t expectedHandle = socketHandles[mux];
+    // The documented read-form query is:
+    //   AT#XSOCKET?
+    //   #XSOCKET: <handle>,<family>,<role>,<type>,<cid>
+    // This modem exposes a global socket table, not a per-mux one. Treating
+    // the mere presence of any valid handle as "our socket is still up" is
+    // wrong when a different socket (or a stale security-tagged one) is open
+    // at the same time.
     sendAT(GF("#XSOCKET?"));
     int8_t res = waitResponse(GF(AT_NL "#XSOCKET:"));
-    if (res != 1) {
-      // Nothing useful returned; don't change what we already believe.
+    if (res == 0) {
       return sockets[mux]->sock_connected;
     }
-    streamSkipUntil(',');  // handle
-    streamSkipUntil(',');  // type
-    int8_t state = streamGetIntBefore('\n');  // non-zero -> connected
+    if (res != 1) {
+      // The command completed (OK/ERROR) but with no "#XSOCKET:" listing
+      // at all -- the modem's socket table is empty, so our handle is
+      // definitely gone. Clear our own bookkeeping too, so callers (e.g.
+      // modemGetAvailable()) stop re-polling a handle that no longer
+      // exists anywhere instead of doing so forever.
+      socketHandles[mux] = -1;
+      if (activeMux == mux) { activeMux = -1; }
+      return false;
+    }
+    int16_t handle = streamGetIntBefore(',');
+    streamSkipUntil('\n');
     waitResponse();
-    return state != 0;
+    return handle == expectedHandle;
   }
 
   /*
    * Utilities
    */
  public:
+  // Rough RSRP guide: > -90 excellent, -90..-105 good,
+  // -105..-115 marginal (expect retransmissions and low throughput),
+  // < -115 poor.
+  int16_t getRsrpDbm() const {
+    return (_cesqRsrp == 255 || _cesqRsrp < 0) ? 0 : (int16_t)(_cesqRsrp - 140);
+  }
+  int16_t getRsrqDb() const {
+    return (_cesqRsrq == 255 || _cesqRsrq < 0) ? 0 : (int16_t)((_cesqRsrq / 2) - 19);
+  }
+
+  // Actively refreshes the RSRP/RSRQ values above via the standard 3GPP
+  // AT+CESQ query.
+  bool refreshSignalQuality() {
+    sendAT(GF("+CESQ"));
+    if (waitResponse(GF(AT_NL "+CESQ:")) != 1) { return false; }
+    streamSkipUntil(',');  // rxlev
+    streamSkipUntil(',');  // ber
+    streamSkipUntil(',');  // rscp
+    streamSkipUntil(',');  // ecno
+    // +CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>
+    _cesqRsrq = streamGetIntBefore(',');
+    _cesqRsrp = streamGetIntBefore('\n');
+    waitResponse();
+    return true;
+  }
+
   bool handleURCs(String& data) {
-    if (data.endsWith(GF("#XRECV:"))) {
-      // Unsolicited notification that data has arrived on the currently
-      // selected socket. SLM's socket model only allows one socket to be
-      // selected at a time, so -- exactly like the explicit send/receive
-      // commands -- we attribute this to whichever mux was most recently
-      // selected. This is safe here because callers of this library are
-      // required to serialize all socket access through an external mutex,
-      // so no other select can race with this in practice.
+    if (data.endsWith(GF("%CESQ:"))) {
+      // "%CESQ: <rsrp>,<rsrp_threshold>,<rsrq>,<rsrq_threshold>" -- the two
+      // signal values are recorded for getRsrpDbm()/getRsrqDb(); the
+      // threshold indices aren't needed.
+      _cesqRsrp = streamGetIntBefore(',');
+      streamSkipUntil(',');  // rsrp threshold index
+      _cesqRsrq = streamGetIntBefore(',');
+      streamSkipUntil('\n');
+      data = "";
+      return true;
+    } else if (data.endsWith(GF("#XRECV:"))) {
+      // Unsolicited notification that data has arrived. This URC's payload
+      // is not confirmed to carry a handle of its own on this firmware, so
+      // -- like the explicit #XSEND/#XRECV commands -- it is attributed to
+      // whichever mux was most recently connected/operated on.
       int16_t len = streamGetIntBefore('\n');
       if (activeMux >= 0 && activeMux < TINY_GSM_MUX_COUNT &&
           sockets[activeMux]) {
@@ -654,14 +966,10 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
     } else if (data.endsWith(GF("#XSOCKET:")) ||
                data.endsWith(GF("#XSSOCKET:")) ||
                data.endsWith(GF("#XCONNECT:"))) {
-      // These prefixes are normally synchronous command responses, already
-      // consumed directly by modemConnect()/selectSocket() before reaching
-      // this generic URC path. The socket commands can however also be
-      // reused for spontaneous close/error notifications, whose payload is
-      // not parsed here. Since this runs in the middle of parsing another
-      // response and must not issue AT commands recursively, the currently
-      // active socket is simply marked as disconnected; the next
-      // connect()/available() call re-establishes the real state.
+      // Normally consumed directly by modemConnect()/closeSocket(); an
+      // unexpected arrival is treated as the active socket having been
+      // closed. The next connect()/available() call re-establishes the real
+      // state.
       streamSkipUntil('\n');
       if (activeMux >= 0 && activeMux < TINY_GSM_MUX_COUNT &&
           sockets[activeMux]) {
@@ -679,13 +987,16 @@ class TinyGsmNRF9151 : public TinyGsmModem<TinyGsmNRF9151>,
 
  protected:
   GsmClientNRF9151* sockets[TINY_GSM_MUX_COUNT];
-  // Modem-assigned socket handle (from #XSOCKET:/#XSSOCKET:) for each mux,
-  // or -1 if that mux currently has no open socket.
+  // Modem-assigned socket handle (from #XSOCKET:/#XSSOCKET:) for each mux
   int16_t socketHandles[TINY_GSM_MUX_COUNT];
-  // Which mux was most recently selected via #XSOCKETSELECT -- used only to
-  // attribute unsolicited notifications (see handleURCs) to the right
-  // socket, not to skip re-issuing #XSOCKETSELECT before an operation.
+  // Which mux was most recently connected/operated on -- used only to
+  // attribute unsolicited notifications (see handleURCs) to the corresponding
+  // socket
   int8_t activeMux;
+  // Signal quality as raw reported indices (from the "%CESQ" URC or
+  // refreshSignalQuality()); see getRsrpDbm()/getRsrqDb().
+  int16_t _cesqRsrp = -1;
+  int16_t _cesqRsrq = -1;
 };
 
 #endif  // SRC_TINYGSMCLIENTNRF9151_H_
